@@ -3,12 +3,44 @@ import chromadb
 from config.settings import Config
 from typing import List, Dict, Optional
 import numpy as np
+from functools import lru_cache
+import hashlib
+import json
+import time
 
 class VectorRetriever:
-    def __init__(self):
+    def __init__(self, cache_ttl: int = 3600):
         self.client = OpenAI(api_key=Config.OPENAI_API_KEY)
         self.chroma_client = chromadb.PersistentClient(path=Config.PERSIST_DIR)
         self.collection = self.chroma_client.get_collection(Config.COLLECTION_NAME)
+        self.cache_ttl = cache_ttl  # 缓存过期时间（秒）
+        self.cache = {}  # 简单的内存缓存
+
+    def _generate_cache_key(self, query: str, top_k: int, filters: Optional[Dict], min_score: float) -> str:
+        """生成缓存键"""
+        cache_dict = {
+            'query': query,
+            'top_k': top_k,
+            'filters': filters,
+            'min_score': min_score
+        }
+        cache_str = json.dumps(cache_dict, sort_keys=True)
+        return hashlib.md5(cache_str.encode()).hexdigest()
+
+    def _get_from_cache(self, cache_key: str) -> Optional[List[Dict]]:
+        """从缓存中获取结果"""
+        if cache_key in self.cache:
+            cached_result, timestamp = self.cache[cache_key]
+            if time.time() - timestamp < self.cache_ttl:
+                return cached_result
+            else:
+                # 删除过期缓存
+                del self.cache[cache_key]
+        return None
+    
+    def _save_to_cache(self, cache_key: str, results: List[Dict]):
+        """保存结果到缓存"""
+        self.cache[cache_key] = (results, time.time())
 
     # 在VectorRetriever类中添加新方法
     def recommend_agent(self, user_prompt: str) -> Dict:
@@ -46,6 +78,7 @@ class VectorRetriever:
             "agent_recommendation": recommendation
         }
 
+    @lru_cache(maxsize=1000)
     def get_embedding(self, text: str) -> list:
         response = self.client.embeddings.create(
             input=text,
@@ -59,14 +92,23 @@ class VectorRetriever:
                filters: Optional[Dict] = None,
                min_score: float = 0.4) -> List[Dict]:
         """
-        混合检索方法
+        混合检索方法 -> 带缓存的混合检索方法
         Args:
             query: 查询文本
             top_k: 返回结果数量
             filters: 元数据过滤条件, 如 {"category": "finance"}
             min_score: 最小相似度阈值
         """
-        # 生成查询向量
+
+        # 生成缓存键
+        cache_key = self._generate_cache_key(query, top_k, filters, min_score)
+        
+        # 尝试从缓存获取结果
+        cached_results = self._get_from_cache(cache_key)
+        if cached_results is not None:
+            return cached_results
+        
+        # 如果缓存未命中，执行检索, 生成查询向量
         query_embedding = self.get_embedding(query)
         # 构建查询参数
         query_params = {
@@ -101,7 +143,10 @@ class VectorRetriever:
             search_results.append(result)
         # 结果排序（综合考虑相似度分数和业务规则）
         search_results = self._rank_results(search_results)
-        return search_results[:top_k]
+        final_results = search_results[:top_k]
+        # 保存到缓存
+        self._save_to_cache(cache_key, final_results)
+        return final_results
     
     def enhanced_search(self,
                         user_prompt: str,

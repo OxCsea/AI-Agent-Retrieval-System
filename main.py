@@ -5,14 +5,15 @@ import gradio as gr
 from init_data import initialize_agents
 
 def get_openai_response(query, sys_prompt):
-    response = client.chat.completions.create(
+    stream_response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": query}
-        ]
+        ],
+        stream=True  # 启用流式输出
     )
-    return response.choices[0].message.content
+    return stream_response
 
 def process_result(results):
      # 格式化输出结果
@@ -36,8 +37,8 @@ def process_query_first(query):
     retriever = VectorRetriever()
     results = retriever.enhanced_search(query)["search_results"]
     agent_search_results, best_match = process_result(results)
-    ai_response = get_openai_response(query, best_match['document'])
-    return agent_search_results, ai_response
+    stream  = get_openai_response(query, best_match['document'])
+    return agent_search_results, stream 
 
 def process_query_second(agent_search_results, query, new_category=None):
     # if feedback == "满意":
@@ -48,11 +49,12 @@ def process_query_second(agent_search_results, query, new_category=None):
     if new_category:
         # 初始化新的agent类型
         new_agents = initialize_agents([new_category], client)
+        stream = get_openai_response(query, new_agents[0]["system_prompt"])
         # 重新进行检索
-        return agent_search_results, get_openai_response(query, new_agents[0]["system_prompt"])
+        return agent_search_results, stream
     else:
-        results = get_openai_response(query, "你是一个AI助手")
-        return agent_search_results, results
+        stream = get_openai_response(query, "你是一个AI助手")
+        return agent_search_results, stream
 
 def main():
     with gr.Blocks() as demo:
@@ -84,47 +86,65 @@ def main():
 
         # 处理首次查询
         def handle_first_query(query):
-            agent_results_text, response = process_query_first(query)
-            state.value = response
-            return {
-                agent_results: agent_results_text,
-                ai_response: response,
-            }
-
+            agent_results_text, stream  = process_query_first(query)
+            # 初始状态
+            yield agent_results_text, ""
+            # 创建生成器函数来仅更新AI响应部分
+            full_response = ""
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    full_response += chunk.choices[0].delta.content
+                    yield  agent_results_text, full_response
+            
         # 处理满意按钮
         def handle_satisfied(agent_results_text, query):
             if state.value:
-                _, response = process_query_second(
+                _, stream  = process_query_second(
                     agent_results_text, 
                     query, 
                     state.value, 
                 )
-                return {ai_response: response}
-            return {ai_response: "请先进行查询"}
+
+                # 保持现有的agent_results，开始流式输出新的回答
+                yield agent_results_text, ""
+                full_response = ""
+                for chunk in stream:
+                    if chunk.choices[0].delta.content is not None:
+                        full_response += chunk.choices[0].delta.content
+                        yield agent_results_text, full_response
+                
+            else:
+                yield agent_results_text, "请先进行查询"
+
 
         # 处理新类型提交
         def handle_new_category(agent_results_text, query, new_category):
-            _, response = process_query_second(
+            _, stream = process_query_second(
                 agent_results_text,
                 query,
                 new_category=new_category
             )
-            return {
-                ai_response: response,
-                new_agent_row: gr.update(visible=False)
-            }
+            # 初始状态
+            yield "", False
+            full_response = ""
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    full_response += chunk.choices[0].delta.content
+                    yield full_response, False
 
         # 设置点击事件
         search_btn.click(
-            handle_first_query,
+            fn=handle_first_query,
             inputs=[query_input],
-            outputs=[agent_results, ai_response]
+            outputs=[agent_results, ai_response],
+            queue=True  # 确保启用队列
         )
 
         satisfied_btn.click(
-            handle_satisfied,
+            fn=handle_satisfied,
             inputs=[agent_results, query_input],
-            outputs=[ai_response]
+            outputs=[agent_results, ai_response],
+            queue=True  # 确保启用队列
         )
 
         unsatisfied_btn.click(
@@ -136,7 +156,8 @@ def main():
         submit_new_category.click(
             handle_new_category,
             inputs=[agent_results, query_input, new_category_input],
-            outputs=[ai_response, new_agent_row]
+            outputs=[ai_response, new_agent_row],
+            queue=True  # 确保启用队列
         )
 
         # Examples remain the same
@@ -149,7 +170,7 @@ def main():
             inputs=query_input
         )
     
-    demo.launch(share=True)
+    demo.queue().launch(share=True)
 
 if __name__ == "__main__":
     # 初始化数据（首次运行后可以注释掉）

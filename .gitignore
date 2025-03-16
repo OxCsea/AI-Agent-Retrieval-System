@@ -4,3 +4,4 @@ chroma_db/
 *.csv
 api-key.env
 bug.md
+TODO.md
