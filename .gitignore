@@ -1,2 +1,6 @@
 chroma_db/
 .env
+*.pyc
+*.csv
+api-key.env
+bug.md
